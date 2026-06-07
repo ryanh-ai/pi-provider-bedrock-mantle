@@ -6,12 +6,16 @@
  * Architecture:
  *   Uses pi's built-in `streamSimpleOpenAIResponses` (publicly exported from
  *   @earendil-works/pi-ai/openai-responses) for ALL streaming, message conversion,
- *   tool call handling, etc. This ensures 100% compatibility with pi's built-in
+ *   tool call handling, etc. This ensures compatibility with pi's built-in
  *   openai-responses implementation.
  *
- *   Auth is handled by wrapping globalThis.fetch with SigV4 signing for requests
- *   to the bedrock-mantle endpoint. This is a scoped, per-request interception that
- *   doesn't affect other providers.
+ *   SigV4 auth is handled by temporarily wrapping globalThis.fetch while Pi's
+ *   OpenAI Responses provider constructs the OpenAI SDK client. The OpenAI SDK
+ *   captures the fetch implementation in its constructor, so the wrapper remains
+ *   scoped to that client after global fetch is restored.
+ *
+ *   If Pi's OpenAI Responses provider later exposes a custom fetch/client option,
+ *   prefer that over global fetch patching.
  *
  * Auth priority:
  *   1. AWS_BEARER_TOKEN_BEDROCK → simple apiKey passthrough (no fetch override)
@@ -25,9 +29,9 @@
 
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
-import { SignatureV4 } from "@smithy/signature-v4";
-import { HttpRequest } from "@smithy/protocol-http";
 import { Sha256 } from "@aws-crypto/sha256-js";
+import { HttpRequest } from "@smithy/protocol-http";
+import { SignatureV4 } from "@smithy/signature-v4";
 import {
   type Api,
   type AssistantMessageEventStream,
@@ -45,6 +49,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const DEFAULT_REGION = "us-east-2";
 const SERVICE = "bedrock";
 
+type FetchLike = typeof globalThis.fetch;
+
+type SigV4Signer = Pick<SignatureV4, "sign">;
+
+interface SigV4FetchOptions {
+  region?: string;
+  service?: string;
+  credentials?: AwsCredentialIdentityProvider;
+  signer?: SigV4Signer;
+}
+
 function getRegion(): string {
   return process.env.BEDROCK_MANTLE_REGION || DEFAULT_REGION;
 }
@@ -53,8 +68,8 @@ function getBaseUrl(): string {
   return `https://bedrock-mantle.${getRegion()}.api.aws/openai/v1`;
 }
 
-function getMantleHostname(): string {
-  return `bedrock-mantle.${getRegion()}.api.aws`;
+function getMantleHostname(region = getRegion()): string {
+  return `bedrock-mantle.${region}.api.aws`;
 }
 
 // =============================================================================
@@ -101,69 +116,138 @@ const MODELS = [
 ];
 
 // =============================================================================
-// SigV4 credentials (cached, auto-refreshing via SDK)
+// SigV4 credentials/signers (cached by effective config, auto-refreshing via SDK)
 // =============================================================================
 
-let credentialProvider: AwsCredentialIdentityProvider | null = null;
+const credentialProviders = new Map<string, AwsCredentialIdentityProvider>();
+const signers = new Map<string, SignatureV4>();
 
-function getCredentialProvider(): AwsCredentialIdentityProvider {
-  if (!credentialProvider) {
-    credentialProvider = fromNodeProviderChain({
-      profile: process.env.AWS_PROFILE,
-    });
+function getCredentialProvider(profile = process.env.AWS_PROFILE): AwsCredentialIdentityProvider {
+  const key = profile || "<default>";
+  let provider = credentialProviders.get(key);
+  if (!provider) {
+    provider = fromNodeProviderChain({ profile });
+    credentialProviders.set(key, provider);
   }
-  return credentialProvider;
+  return provider;
+}
+
+function getSigner(region = getRegion(), service = SERVICE): SignatureV4 {
+  const profile = process.env.AWS_PROFILE || "<default>";
+  const key = `${service}:${region}:${profile}`;
+  let signer = signers.get(key);
+  if (!signer) {
+    signer = new SignatureV4({
+      service,
+      region,
+      credentials: getCredentialProvider(process.env.AWS_PROFILE),
+      sha256: Sha256,
+    });
+    signers.set(key, signer);
+  }
+  return signer;
 }
 
 // =============================================================================
 // SigV4 fetch wrapper — intercepts fetch calls to bedrock-mantle and signs them
 // =============================================================================
 
-const originalFetch = globalThis.fetch;
+function headersToRecord(headers?: HeadersInit): Record<string, string> {
+  if (!headers) return {};
+  return Object.fromEntries(new Headers(headers).entries());
+}
 
-async function sigv4WrappedFetch(
-  input: RequestInfo | URL,
-  init?: RequestInit,
-): Promise<Response> {
-  const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+function getRequestUrl(input: RequestInfo | URL): string {
+  return typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+}
 
-  // Only intercept requests to our bedrock-mantle endpoint
-  if (!url.includes(getMantleHostname())) {
-    return originalFetch(input, init);
-  }
+function getRequestMethod(input: RequestInfo | URL, init?: RequestInit): string {
+  if (init?.method) return init.method;
+  if (typeof Request !== "undefined" && input instanceof Request) return input.method;
+  return "GET";
+}
 
-  const parsedUrl = new URL(url);
-  const region = getRegion();
-  const body = typeof init?.body === "string" ? init.body : undefined;
+function getRequestHeaders(input: RequestInfo | URL, init?: RequestInit): Record<string, string> {
+  return {
+    ...(typeof Request !== "undefined" && input instanceof Request ? headersToRecord(input.headers) : {}),
+    ...headersToRecord(init?.headers),
+  };
+}
 
-  const request = new HttpRequest({
-    method: init?.method || "POST",
-    protocol: parsedUrl.protocol,
-    hostname: parsedUrl.hostname,
-    port: parsedUrl.port ? Number(parsedUrl.port) : undefined,
-    path: parsedUrl.pathname + parsedUrl.search,
-    headers: {
-      "content-type": "application/json",
-      host: parsedUrl.hostname,
-    },
-    body: body || undefined,
-  });
+function getRequestBody(input: RequestInfo | URL, init?: RequestInit): BodyInit | null | undefined {
+  if (init && "body" in init) return init.body;
+  if (typeof Request !== "undefined" && input instanceof Request) return input.body;
+  return undefined;
+}
 
-  const signer = new SignatureV4({
-    service: SERVICE,
-    region,
-    credentials: getCredentialProvider(),
-    sha256: Sha256,
-  });
+function getRequestSignal(input: RequestInfo | URL, init?: RequestInit): AbortSignal | null | undefined {
+  if (init?.signal) return init.signal;
+  if (typeof Request !== "undefined" && input instanceof Request) return input.signal;
+  return undefined;
+}
 
-  const signed = await signer.sign(request);
+function assertStringBody(body: BodyInit | null | undefined): string | undefined {
+  if (body == null) return undefined;
+  if (typeof body === "string") return body;
+  throw new Error("bedrock-mantle SigV4 fetch wrapper only supports string request bodies");
+}
 
-  return originalFetch(url, {
-    method: init?.method || "POST",
-    headers: signed.headers as Record<string, string>,
-    body,
-    signal: init?.signal,
-  });
+export function createSigV4Fetch(baseFetch: FetchLike = globalThis.fetch, options: SigV4FetchOptions = {}): FetchLike {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = getRequestUrl(input);
+    const parsedUrl = new URL(url);
+    const region = options.region || getRegion();
+
+    // Only intercept requests to the exact bedrock-mantle endpoint hostname.
+    if (parsedUrl.hostname !== getMantleHostname(region)) {
+      return baseFetch(input, init);
+    }
+
+    const method = getRequestMethod(input, init);
+    const rawBody = getRequestBody(input, init);
+    const body = assertStringBody(rawBody);
+    const headers = getRequestHeaders(input, init);
+
+    // The OpenAI SDK adds a dummy bearer token because it requires an apiKey.
+    // SigV4 must own the Authorization header.
+    delete headers.authorization;
+    delete headers.Authorization;
+
+    if (!headers["content-type"] && !headers["Content-Type"] && body !== undefined) {
+      headers["content-type"] = "application/json";
+    }
+    headers.host = parsedUrl.host;
+
+    const request = new HttpRequest({
+      method,
+      protocol: parsedUrl.protocol,
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port ? Number(parsedUrl.port) : undefined,
+      path: parsedUrl.pathname + parsedUrl.search,
+      headers,
+      body,
+    });
+
+    const signer =
+      options.signer ||
+      (options.credentials
+        ? new SignatureV4({
+            service: options.service || SERVICE,
+            region,
+            credentials: options.credentials,
+            sha256: Sha256,
+          })
+        : getSigner(region, options.service || SERVICE));
+    const signed = await signer.sign(request);
+
+    return baseFetch(url, {
+      ...init,
+      method,
+      headers: signed.headers as Record<string, string>,
+      body,
+      signal: getRequestSignal(input, init),
+    });
+  };
 }
 
 // =============================================================================
@@ -176,33 +260,23 @@ function streamBedrockMantleSigV4(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   // Temporarily override globalThis.fetch so the OpenAI SDK (used internally by
-  // streamSimpleOpenAIResponses) routes through our SigV4 signer.
-  // This is scoped: only requests matching bedrock-mantle hostname are signed;
-  // all other fetch calls pass through unmodified.
+  // streamSimpleOpenAIResponses) captures our SigV4 signer in its constructor.
+  // The local createSigV4Fetch wrapper delegates to the fetch that was current
+  // immediately before this call, avoiding stale module-load fetch capture.
   const prevFetch = globalThis.fetch;
-  globalThis.fetch = sigv4WrappedFetch as typeof globalThis.fetch;
+  globalThis.fetch = createSigV4Fetch(prevFetch) as typeof globalThis.fetch;
 
   try {
     // Call pi's built-in openai-responses streaming with a dummy apiKey
-    // (the real auth is handled by our fetch wrapper)
-    const stream = streamSimpleOpenAIResponses(
-      model as Model<"openai-responses">,
-      context,
-      {
-        ...options,
-        apiKey: "sigv4-managed",
-      },
-    );
+    // (the real auth is handled by our fetch wrapper).
+    const stream = streamSimpleOpenAIResponses(model as Model<"openai-responses">, context, {
+      ...options,
+      apiKey: "sigv4-managed",
+    });
 
-    // Restore fetch after the stream setup completes.
-    // The OpenAI SDK captures the fetch reference at client creation time,
-    // so it continues using our wrapper for the duration of this stream.
-    // We restore globalThis.fetch immediately so other concurrent requests
-    // are unaffected.
-    //
-    // Note: The OpenAI SDK captures `fetch` in its constructor, which happens
-    // synchronously inside streamSimpleOpenAIResponses. By the time we restore
-    // here, the client already holds a reference to our sigv4WrappedFetch.
+    // Restore fetch after client construction. This relies on the OpenAI SDK
+    // capturing fetch synchronously in its constructor, which Pi's provider calls
+    // before the first await. A future Pi custom-fetch hook would be preferable.
     globalThis.fetch = prevFetch;
 
     return stream;
@@ -233,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     });
   } else {
     // SigV4: use pi's built-in openai-responses via streamSimple wrapper
-    // that patches fetch to sign requests.
+    // that patches fetch only while the OpenAI SDK client is constructed.
     pi.registerProvider("bedrock-mantle", {
       name: "Amazon Bedrock (OpenAI)",
       baseUrl,
