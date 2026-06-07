@@ -7,19 +7,52 @@ Pi extension for **OpenAI GPT-5.5/5.4 models and Codex on Amazon Bedrock** via t
 1. **`AWS_BEARER_TOKEN_BEDROCK`** env var → Simple Bearer token (no SigV4 needed)
 2. **AWS SDK credential chain** → SigV4 signing (profile, env vars, SSO, instance role, etc.)
 
-## Quick Start
+## Installation
+
+Install the provider as a Pi package from GitHub:
 
 ```bash
-# Install
-cd pi-provider-bedrock-mantle
-npm install
-npm run build
-
-# Run pi with the extension
-pi -e ./pi-provider-bedrock-mantle
+pi install git:github.com/ryanh-ai/pi-provider-bedrock-mantle
 ```
 
-Then use `/model` and select `GPT-5.5 (Bedrock)` or `GPT-5.4 (Bedrock)`.
+For a project-local install, add `-l` so the package is written to `.pi/settings.json`:
+
+```bash
+pi install -l git:github.com/ryanh-ai/pi-provider-bedrock-mantle
+```
+
+Verify the provider is available:
+
+```bash
+pi --list-models bedrock-mantle
+```
+
+You should see models such as `bedrock-mantle/openai.gpt-5.5` and `bedrock-mantle/openai.gpt-5.4`.
+
+## Quick Start
+
+With AWS profile/SigV4 auth:
+
+```bash
+AWS_PROFILE=your-aws-profile BEDROCK_MANTLE_REGION=us-east-2 \
+pi --model bedrock-mantle/openai.gpt-5.5
+```
+
+For a one-shot prompt:
+
+```bash
+AWS_PROFILE=your-aws-profile BEDROCK_MANTLE_REGION=us-east-2 \
+pi --model bedrock-mantle/openai.gpt-5.5 -p "Say hello"
+```
+
+With a Bedrock bearer token instead of SigV4:
+
+```bash
+AWS_BEARER_TOKEN_BEDROCK=your-api-key \
+pi --model bedrock-mantle/openai.gpt-5.5
+```
+
+In interactive Pi, you can also use `/model` and select `GPT-5.5 (Bedrock)` or `GPT-5.4 (Bedrock)`.
 
 ## Configuration
 
@@ -53,22 +86,32 @@ This rewrite is provider-local: it changes the outgoing Bedrock payload but does
 
 If Pi's `read` tool cannot resize an image below Pi's inline image limit, it may return only a text fallback such as `[Image omitted: could not be resized below the inline image size limit.]`. In that case there is no image block for this provider to relocate.
 
-## Examples
+## Updating or Removing
 
-### With AWS Profile (SigV4)
-
-```bash
-AWS_PROFILE=fmevals-private pi -e ./pi-provider-bedrock-mantle
-```
-
-### With Bedrock API Key
+Update installed Pi packages:
 
 ```bash
-AWS_BEARER_TOKEN_BEDROCK=your-api-key pi -e ./pi-provider-bedrock-mantle
+pi update git:github.com/ryanh-ai/pi-provider-bedrock-mantle
 ```
 
-### Custom Region
+Remove the provider:
 
 ```bash
-BEDROCK_MANTLE_REGION=us-west-2 pi -e ./pi-provider-bedrock-mantle
+pi remove git:github.com/ryanh-ai/pi-provider-bedrock-mantle
 ```
+
+## Local Development
+
+To test a local checkout without installing it permanently:
+
+```bash
+git clone https://github.com/ryanh-ai/pi-provider-bedrock-mantle.git
+cd pi-provider-bedrock-mantle
+npm install
+npm run build
+
+AWS_PROFILE=your-aws-profile BEDROCK_MANTLE_REGION=us-east-2 \
+pi -e . --model bedrock-mantle/openai.gpt-5.5
+```
+
+`pi -e .` loads the local package for that run only. For normal usage, prefer `pi install git:github.com/ryanh-ai/pi-provider-bedrock-mantle`.

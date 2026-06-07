@@ -9,7 +9,7 @@ import type { Api, Context, Model, Tool } from "@earendil-works/pi-ai";
  * These replicate pi-mono's packages/ai/test/stream.test.ts patterns
  * against the bedrock-mantle endpoint via SigV4 auth.
  *
- * Requires: AWS_PROFILE=fmevals-private (or equivalent credentials)
+ * Requires: AWS_PROFILE=your-aws-profile (or equivalent credentials)
  * Run: npx vitest run
  */
 
