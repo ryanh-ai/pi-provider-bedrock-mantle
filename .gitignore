@@ -1,2 +1,8 @@
 node_modules/
 dist/
+
+# Python
+.venv/
+__pycache__/
+*.py
+.pytest_cache/

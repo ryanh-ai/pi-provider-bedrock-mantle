@@ -1,4 +1,4 @@
-# pi-bedrock-mantle-provider
+# pi-provider-bedrock-mantle
 
 Pi extension for **OpenAI GPT-5.5/5.4 models and Codex on Amazon Bedrock** via the `bedrock-mantle` endpoint.
 

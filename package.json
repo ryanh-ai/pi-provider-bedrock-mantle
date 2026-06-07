@@ -1,5 +1,5 @@
 {
-  "name": "pi-bedrock-mantle-provider",
+  "name": "pi-provider-bedrock-mantle",
   "version": "0.1.0",
   "description": "Pi extension for OpenAI models on Amazon Bedrock (bedrock-mantle endpoint)",
   "type": "module",
