@@ -36,6 +36,7 @@ import {
   type Api,
   type AssistantMessageEventStream,
   type Context,
+  type ImageContent,
   type Message,
   type Model,
   type SimpleStreamOptions,
@@ -176,6 +177,10 @@ function getRequestHeaders(input: RequestInfo | URL, init?: RequestInit): Record
   };
 }
 
+function getContentTypeHeader(headers: Record<string, string>): string | undefined {
+  return headers["content-type"] || headers["Content-Type"];
+}
+
 function getRequestBody(input: RequestInfo | URL, init?: RequestInit): BodyInit | null | undefined {
   if (init && "body" in init) return init.body;
   if (typeof Request !== "undefined" && input instanceof Request) return input.body;
@@ -208,17 +213,11 @@ export function createSigV4Fetch(baseFetch: FetchLike = globalThis.fetch, option
     const method = getRequestMethod(input, init);
     const rawBody = getRequestBody(input, init);
     const body = assertStringBody(rawBody);
-    const headers = getRequestHeaders(input, init);
-
-    // The OpenAI SDK adds a dummy bearer token because it requires an apiKey.
-    // SigV4 must own the Authorization header.
-    delete headers.authorization;
-    delete headers.Authorization;
-
-    if (!headers["content-type"] && !headers["Content-Type"] && body !== undefined) {
-      headers["content-type"] = "application/json";
-    }
-    headers.host = parsedUrl.host;
+    const requestHeaders = getRequestHeaders(input, init);
+    const headers: Record<string, string> = {
+      "content-type": getContentTypeHeader(requestHeaders) || "application/json",
+      host: parsedUrl.hostname,
+    };
 
     const request = new HttpRequest({
       method,
@@ -243,7 +242,6 @@ export function createSigV4Fetch(baseFetch: FetchLike = globalThis.fetch, option
     const signed = await signer.sign(request);
 
     return baseFetch(url, {
-      ...init,
       method,
       headers: signed.headers as Record<string, string>,
       body,
@@ -256,29 +254,119 @@ export function createSigV4Fetch(baseFetch: FetchLike = globalThis.fetch, option
 // Bedrock-mantle compatibility shims
 // =============================================================================
 
-function imageOmissionText(mimeType: string, data: string): TextContent {
+interface ToolResultImageRef {
+  image: ImageContent;
+  sourceName: string;
+  toolName?: string;
+}
+
+function formatImageSourceName(toolName: string | undefined, explicitName: string | undefined, index?: number): string {
+  const suffix = index === undefined ? "" : ` #${index + 1}`;
+  if (explicitName) return `${explicitName}${suffix}`;
+  if (toolName) return `${toolName} image${suffix}`;
+  return `tool result image${suffix}`;
+}
+
+function getToolCallSourceName(context: Context, toolCallId: string): string | undefined {
+  const [callId] = toolCallId.split("|");
+  for (const message of context.messages) {
+    if (message.role !== "assistant") continue;
+    for (const block of message.content) {
+      if (block.type !== "toolCall") continue;
+      const [blockCallId] = block.id.split("|");
+      if (block.id !== toolCallId && blockCallId !== callId) continue;
+      const args = block.arguments as Record<string, unknown>;
+      const candidate = args.path ?? args.file ?? args.filename ?? args.name ?? args.url;
+      return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+    }
+  }
+  return undefined;
+}
+
+function imageOmissionText(ref: ToolResultImageRef): TextContent {
   return {
     type: "text",
-    text: `[Image output omitted: ${mimeType}, ${data.length} base64 chars. bedrock-mantle does not support images in tool result outputs.]`,
+    text: `[Image output (${ref.sourceName}) follows after the adjacent tool results in a user message due to provider compatibility: ${ref.image.mimeType}, ${ref.image.data.length} base64 chars. Analyze that attached image as this tool's image output.]`,
   };
 }
 
-function sanitizeToolResultMessage(message: Message): Message {
-  if (message.role !== "toolResult" || !message.content.some((block) => block.type === "image")) {
-    return message;
-  }
+function toolResultImageUserText(refs: ToolResultImageRef[]): TextContent {
+  const imageWord = refs.length === 1 ? "image" : "images";
+  const attachedWord = refs.length === 1 ? "attached image" : "attached images";
+  const beVerb = refs.length === 1 ? "is" : "are";
+  const objectPronoun = refs.length === 1 ? "it" : "them";
+  const subjectPronoun = refs.length === 1 ? "it" : "they";
+  const sourceList = refs.map((ref, index) => `${index + 1}. ${ref.sourceName}`).join("; ");
+  return {
+    type: "text",
+    text: `SYSTEM-COMPATIBILITY NOTE: The immediately preceding adjacent tool result block contained ${refs.length} ${imageWord}, but this provider cannot place images directly inside function_call_output. The ${attachedWord} ${beVerb} the image output from those immediately preceding tool calls. Image source names: ${sourceList}. Analyze ${objectPronoun} as if ${subjectPronoun} were returned by those tools. Do not say the image is missing or omitted. Reminder: use the ${attachedWord} to answer the user's request.`,
+  };
+}
 
+function collectToolResultImageRefs(
+  context: Context,
+  message: Extract<Message, { role: "toolResult" }>,
+): ToolResultImageRef[] {
+  const explicitName = getToolCallSourceName(context, message.toolCallId);
+  const images = message.content.filter((block): block is ImageContent => block.type === "image");
+  return images.map((image, index) => ({
+    image,
+    sourceName: formatImageSourceName(message.toolName, explicitName, images.length > 1 ? index : undefined),
+    toolName: message.toolName,
+  }));
+}
+
+function sanitizeToolResultMessage(
+  message: Extract<Message, { role: "toolResult" }>,
+  refs: ToolResultImageRef[],
+): Extract<Message, { role: "toolResult" }> {
+  let imageIndex = 0;
   return {
     ...message,
-    content: message.content.map((block) =>
-      block.type === "image" ? imageOmissionText(block.mimeType, block.data) : block,
-    ),
+    content: message.content.map((block) => {
+      if (block.type !== "image") return block;
+      return imageOmissionText(refs[imageIndex++]);
+    }),
   };
 }
 
 export function sanitizeContextForBedrockMantle(context: Context): Context {
-  const sanitizedMessages = context.messages.map(sanitizeToolResultMessage);
-  const changed = sanitizedMessages.some((message, index) => message !== context.messages[index]);
+  const sanitizedMessages: Message[] = [];
+  let changed = false;
+
+  for (let i = 0; i < context.messages.length; i++) {
+    const message = context.messages[i];
+    if (message.role !== "toolResult") {
+      sanitizedMessages.push(message);
+      continue;
+    }
+
+    const adjacentToolResults: Extract<Message, { role: "toolResult" }>[] = [];
+    for (let j = i; j < context.messages.length; j++) {
+      const entry = context.messages[j];
+      if (entry.role !== "toolResult") break;
+      adjacentToolResults.push(entry);
+    }
+
+    const runRefs: ToolResultImageRef[] = [];
+    for (const toolResult of adjacentToolResults) {
+      const refs = collectToolResultImageRefs(context, toolResult);
+      runRefs.push(...refs);
+      sanitizedMessages.push(refs.length > 0 ? sanitizeToolResultMessage(toolResult, refs) : toolResult);
+      if (refs.length > 0) changed = true;
+    }
+
+    if (runRefs.length > 0) {
+      sanitizedMessages.push({
+        role: "user",
+        content: [toolResultImageUserText(runRefs), ...runRefs.map((ref) => ref.image)],
+        timestamp: adjacentToolResults[adjacentToolResults.length - 1]?.timestamp ?? message.timestamp,
+      });
+    }
+
+    i += adjacentToolResults.length - 1;
+  }
+
   return changed ? { ...context, messages: sanitizedMessages } : context;
 }
 

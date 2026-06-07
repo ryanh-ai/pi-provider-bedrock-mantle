@@ -18,7 +18,7 @@ describe("createSigV4Fetch", () => {
     expect(baseFetch).toHaveBeenCalledWith("https://example.com/proxy/bedrock-mantle.us-east-2.api.aws", init);
   });
 
-  it("signs exact mantle hostname requests and preserves request details", async () => {
+  it("signs exact mantle hostname requests with stable minimal headers", async () => {
     const baseFetch = vi.fn(async () => response());
     const signer = {
       sign: vi.fn(async (request: any) => ({
@@ -49,8 +49,9 @@ describe("createSigV4Fetch", () => {
     expect(signedRequest.path).toBe("/openai/v1/responses?x=1");
     expect(signedRequest.body).toBe("{\"input\":\"hi\"}");
     expect(signedRequest.headers.host).toBe("bedrock-mantle.us-east-2.api.aws");
-    expect(signedRequest.headers.accept).toBe("text/event-stream");
-    expect(signedRequest.headers["x-custom"]).toBe("kept");
+    expect(signedRequest.headers["content-type"]).toBe("application/json");
+    expect(signedRequest.headers.accept).toBeUndefined();
+    expect(signedRequest.headers["x-custom"]).toBeUndefined();
     expect(signedRequest.headers.authorization).toBeUndefined();
 
     expect(baseFetch).toHaveBeenCalledOnce();
