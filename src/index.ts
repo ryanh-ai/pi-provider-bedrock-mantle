@@ -36,8 +36,10 @@ import {
   type Api,
   type AssistantMessageEventStream,
   type Context,
+  type Message,
   type Model,
   type SimpleStreamOptions,
+  type TextContent,
 } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/openai-responses";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -251,8 +253,46 @@ export function createSigV4Fetch(baseFetch: FetchLike = globalThis.fetch, option
 }
 
 // =============================================================================
+// Bedrock-mantle compatibility shims
+// =============================================================================
+
+function imageOmissionText(mimeType: string, data: string): TextContent {
+  return {
+    type: "text",
+    text: `[Image output omitted: ${mimeType}, ${data.length} base64 chars. bedrock-mantle does not support images in tool result outputs.]`,
+  };
+}
+
+function sanitizeToolResultMessage(message: Message): Message {
+  if (message.role !== "toolResult" || !message.content.some((block) => block.type === "image")) {
+    return message;
+  }
+
+  return {
+    ...message,
+    content: message.content.map((block) =>
+      block.type === "image" ? imageOmissionText(block.mimeType, block.data) : block,
+    ),
+  };
+}
+
+export function sanitizeContextForBedrockMantle(context: Context): Context {
+  const sanitizedMessages = context.messages.map(sanitizeToolResultMessage);
+  const changed = sanitizedMessages.some((message, index) => message !== context.messages[index]);
+  return changed ? { ...context, messages: sanitizedMessages } : context;
+}
+
+// =============================================================================
 // Stream wrapper: calls pi's built-in streamSimpleOpenAIResponses with SigV4
 // =============================================================================
+
+function streamBedrockMantleBearer(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  return streamSimpleOpenAIResponses(model as Model<"openai-responses">, sanitizeContextForBedrockMantle(context), options);
+}
 
 function streamBedrockMantleSigV4(
   model: Model<Api>,
@@ -269,7 +309,7 @@ function streamBedrockMantleSigV4(
   try {
     // Call pi's built-in openai-responses streaming with a dummy apiKey
     // (the real auth is handled by our fetch wrapper).
-    const stream = streamSimpleOpenAIResponses(model as Model<"openai-responses">, context, {
+    const stream = streamSimpleOpenAIResponses(model as Model<"openai-responses">, sanitizeContextForBedrockMantle(context), {
       ...options,
       apiKey: "sigv4-managed",
     });
@@ -304,6 +344,7 @@ export default function (pi: ExtensionAPI) {
       api: "openai-responses",
       authHeader: true,
       models: MODELS,
+      streamSimple: streamBedrockMantleBearer,
     });
   } else {
     // SigV4: use pi's built-in openai-responses via streamSimple wrapper
