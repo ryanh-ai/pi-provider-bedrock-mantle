@@ -21,24 +21,25 @@
   ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
     "@aws-sdk/credential-providers": "^3.800.0",
     "@smithy/protocol-http": "^5.0.0",
     "@smithy/signature-v4": "^5.0.0",
-    "openai": "^6.39.0"
+    "openai": "^6.39.0",
+    "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "^0.34.49",
     "typescript": "^5.7.0",
     "vitest": "^4.1.7"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.78.0",
     "@earendil-works/pi-coding-agent": ">=0.78.0"
   }
 }
