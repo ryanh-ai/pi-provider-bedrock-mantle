@@ -13,12 +13,16 @@
   },
   "keywords": [
     "pi",
+    "pi-package",
     "bedrock",
     "openai",
     "gpt-5",
     "aws"
   ],
   "license": "MIT",
+  "pi": {
+    "extensions": ["./dist/index.js"]
+  },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
     "@aws-sdk/credential-providers": "^3.800.0",
